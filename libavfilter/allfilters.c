@@ -230,6 +230,7 @@ extern AVFilter ff_vf_find_rect;
 extern AVFilter ff_vf_floodfill;
 extern AVFilter ff_vf_format;
 extern AVFilter ff_vf_fps;
+extern AVFilter ff_vf_fps_precisely;
 extern AVFilter ff_vf_framepack;
 extern AVFilter ff_vf_framerate;
 extern AVFilter ff_vf_framestep;
