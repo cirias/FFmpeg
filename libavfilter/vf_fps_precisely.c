@@ -32,6 +32,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
 #include "filters.h"
 #include "internal.h"
@@ -147,13 +148,16 @@ static int config_props(AVFilterLink* outlink)
 
 static int config_timebase(AVFilterContext *ctx, AVFilterLink *inlink, AVFilterLink *outlink)
 {
+    int64_t gcd;
+    int64_t lcm;
+
     FPSPreciselyContext *s = ctx->priv;
     if (s->timebase_den != 0 && s->in_timebase_num != 0 && s->out_timebase_num != 0) {
         return 0;
     }
 
-    int64_t gcd = av_gcd(inlink->time_base.den, outlink->time_base.den);
-    int64_t lcm = (inlink->time_base.den / gcd) * outlink->time_base.den;
+    gcd = av_gcd(inlink->time_base.den, outlink->time_base.den);
+    lcm = (inlink->time_base.den / gcd) * outlink->time_base.den;
 
     s->timebase_den = lcm;
     s->in_timebase_num = inlink->time_base.num * (s->timebase_den / inlink->time_base.den);
@@ -193,20 +197,52 @@ static int read_frame(AVFilterContext *ctx, FPSPreciselyContext *s, AVFilterLink
     return 1;
 }
 
+static int fill_frame_zero(AVFrame* frame, int w, int h, int fmt)
+{
+    int ret;
+    int planes;
+    const AVPixFmtDescriptor *desc;
+
+    if (frame == NULL)
+        return AVERROR(ENOMEM);
+
+    frame->width = w;
+    frame->height = h;
+    frame->format = fmt;
+
+    if ((ret = av_frame_get_buffer(frame, 32)) < 0 || (ret = av_frame_make_writable(frame)) < 0) {
+        return ret;
+    }
+
+    planes = av_pix_fmt_count_planes(fmt);
+    desc = av_pix_fmt_desc_get(fmt);
+    for (int i = 0; i < planes; i++) {
+        // https://ffmpeg.org/doxygen/3.1/imgutils_8c_source.html#l00383
+        int shift = (i == 1 || i == 2) ? desc->log2_chroma_h : 0;
+        int hh = (h + (1 << shift) - 1) >> shift;
+        memset(frame->data[i], 0, hh * frame->linesize[i]);
+    }
+
+    return 0;
+}
+
+
 /* Write a frame to the output */
 static int write_frame(AVFilterContext *ctx, FPSPreciselyContext *s, AVFilterLink *outlink, int *again)
 {
+    int ret;
     AVFrame *frame;
+    int64_t in_timestamps[2] = {};
+    int64_t out_timestamp;
 
     av_assert1(s->frames_count == 2 || (s->status && s->frames_count == 1));
 
-    int64_t in_timestamps[2] = {};
     for (int i = 0; i < s->frames_count; i++) {
         in_timestamps[i] = s->frames[i]->pts * s->in_timebase_num;
         av_log(ctx, AV_LOG_VERBOSE, "in_timestamps[%d] %"PRId64"\n", i, in_timestamps[i]);
     }
 
-    int64_t out_timestamp = s->out_next_pts * s->out_timebase_num;
+    out_timestamp = s->out_next_pts * s->out_timebase_num;
     av_log(ctx, AV_LOG_VERBOSE, "out_timestamp %"PRId64"\n", out_timestamp);
 
 
@@ -224,16 +260,29 @@ static int write_frame(AVFilterContext *ctx, FPSPreciselyContext *s, AVFilterLin
         return 0;
     }
 
-    /* Output a copy of the first buffered frame */
-    frame = av_frame_clone(s->frames[0]);
-    if (!frame)
-        return AVERROR(ENOMEM);
-    // Make sure Closed Captions will not be duplicated
-    av_frame_remove_side_data(s->frames[0], AV_FRAME_DATA_A53_CC);
+    if (abs(in_timestamps[0] - out_timestamp) > (s->out_timebase_num / 2)) {
+        frame = av_frame_alloc();
+        if (!frame)
+            return AVERROR(ENOMEM);
+
+        if ((ret = fill_frame_zero(frame, s->frames[0]->width, s->frames[0]->height, s->frames[0]->format)) < 0)
+            return ret;
+
+        av_log(ctx, AV_LOG_DEBUG, "Writing empty frame to pts %"PRId64"\n", s->out_next_pts);
+    } else {
+        /* Output a copy of the first buffered frame */
+        frame = av_frame_clone(s->frames[0]);
+        if (!frame)
+            return AVERROR(ENOMEM);
+        // Make sure Closed Captions will not be duplicated
+        av_frame_remove_side_data(s->frames[0], AV_FRAME_DATA_A53_CC);
+
+        av_log(ctx, AV_LOG_DEBUG, "Writing frame with pts %"PRId64" to pts %"PRId64"\n",
+            s->frames[0]->pts, s->out_next_pts);
+    }
+
     frame->pts = s->out_next_pts++;
 
-    av_log(ctx, AV_LOG_DEBUG, "Writing frame with pts %"PRId64" to pts %"PRId64"\n",
-           s->frames[0]->pts, frame->pts);
     s->cur_frame_out++;
 
     return ff_filter_frame(outlink, frame);
@@ -245,11 +294,11 @@ static int activate(AVFilterContext *ctx)
     AVFilterLink *inlink  = ctx->inputs[0];
     AVFilterLink *outlink = ctx->outputs[0];
 
-    config_timebase(ctx, inlink, outlink);
-
     int ret;
     int again = 0;
     int64_t status_pts;
+
+    config_timebase(ctx, inlink, outlink);
 
     FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
 
