@@ -951,6 +951,12 @@ calc_times:
             goto calc_times;
     }
 
+    /* set start_time, start_pts for the very first segment */
+    if (pkt->stream_index == seg->reference_stream_index && seg->frame_count == 0) {
+        seg->cur_entry.start_time = (double)pkt->pts * av_q2d(st->time_base);
+        seg->cur_entry.start_pts = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
+    }
+
     if (pkt->stream_index == seg->reference_stream_index) {
         if (pkt->pts != AV_NOPTS_VALUE)
             seg->cur_entry.end_time =
