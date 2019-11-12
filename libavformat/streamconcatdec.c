@@ -1,0 +1,245 @@
+/*
+ * RAW video demuxer
+ * Copyright (c) 2001 Fabrice Bellard
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#include "libavutil/imgutils.h"
+#include "libavutil/parseutils.h"
+#include "libavutil/timestamp.h"
+#include "libavutil/pixdesc.h"
+#include "libavutil/opt.h"
+#include "internal.h"
+#include "avformat.h"
+
+typedef struct StreamConcatDemuxerContext {
+    const AVClass *class;     /**< Class for private options. */
+    AVFormatContext *avf;     /**< Internal AVFormatContext of source file */
+    AVBPrint bp;              /**< Buffer for line */
+    int source_stream_index;  /**< Video stream index of the source file */
+    int64_t start_time;       /**< Start time of the whole demuxed video */
+    int64_t duration;         /**< Duration sum of all processed files, not include current processing file */
+} StreamConcatDemuxerContext;
+
+
+static int copy_stream_props(AVStream *st, AVStream *source_st)
+{
+    int ret;
+
+    if (st->codecpar->codec_id || !source_st->codecpar->codec_id) {
+        if (st->codecpar->extradata_size < source_st->codecpar->extradata_size) {
+            if (st->codecpar->extradata) {
+                av_freep(&st->codecpar->extradata);
+                st->codecpar->extradata_size = 0;
+            }
+            ret = ff_alloc_extradata(st->codecpar,
+                                     source_st->codecpar->extradata_size);
+            if (ret < 0)
+                return ret;
+        }
+        memcpy(st->codecpar->extradata, source_st->codecpar->extradata,
+               source_st->codecpar->extradata_size);
+        return 0;
+    }
+    if ((ret = avcodec_parameters_copy(st->codecpar, source_st->codecpar)) < 0)
+        return ret;
+    st->r_frame_rate        = source_st->r_frame_rate;
+    st->avg_frame_rate      = source_st->avg_frame_rate;
+    st->sample_aspect_ratio = source_st->sample_aspect_ratio;
+    avpriv_set_pts_info(st, 64, source_st->time_base.num, source_st->time_base.den);
+
+    av_dict_copy(&st->metadata, source_st->metadata, 0);
+    return 0;
+}
+
+#define FAIL(retcode) do { ret = (retcode); goto fail; } while(0)
+
+static int streamconcat_read_close(AVFormatContext *ctx)
+{
+    StreamConcatDemuxerContext *cat = ctx->priv_data;
+
+    av_bprint_finalize(&cat->bp, NULL);
+
+    if (cat->avf)
+        avformat_close_input(&cat->avf);
+
+    return 0;
+}
+
+static int find_video_stream_index(AVFormatContext *avf)
+{
+    int i = 0;
+    AVStream *st;
+
+    for (i = 0; i < avf->nb_streams; i++) {
+        st = avf->streams[i];
+        if (st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+          return i;
+        }
+    }
+
+    return -1;
+}
+
+static int open_file(AVFormatContext *ctx, char *filename)
+{
+    StreamConcatDemuxerContext *cat = ctx->priv_data;
+    int ret = 0;
+    AVStream *source_st;
+    AVStream *st;
+
+    if (cat->avf) {
+        cat->duration += cat->avf->duration;
+        avformat_close_input(&cat->avf);
+    }
+
+    ret = avformat_open_input(&cat->avf, filename, NULL, NULL);
+    if (ret < 0)
+        return ret;
+
+    if (cat->start_time == AV_NOPTS_VALUE) {
+      cat->start_time = (cat->avf->start_time == AV_NOPTS_VALUE) ? 0 : cat->avf->start_time;
+    }
+
+    cat->source_stream_index = find_video_stream_index(cat->avf);
+    if (cat->source_stream_index < 0) {
+        av_log(ctx, AV_LOG_ERROR, "no video stream in input: %s\n", filename);
+        return AVERROR_INVALIDDATA;
+    }
+    source_st = cat->avf->streams[cat->source_stream_index];
+
+    if (ctx->nb_streams < 1) {
+        st = avformat_new_stream(ctx, NULL);
+        if (!st)
+            return AVERROR(ENOMEM);
+    } else {
+        st = ctx->streams[0];
+    }
+
+    ret = copy_stream_props(st, source_st);
+    return ret;
+}
+
+static int open_next_file(AVFormatContext *ctx)
+{
+    StreamConcatDemuxerContext *cat = ctx->priv_data;
+    int ret = 0;
+
+    ret = ff_read_line_to_bprint_overwrite(ctx->pb, &cat->bp);
+    if (ret < 0)
+        return ret;
+
+    ret = open_file(ctx, cat->bp.str);
+    return ret;
+}
+
+static int streamconcat_read_header(AVFormatContext *ctx)
+{
+    StreamConcatDemuxerContext *cat = ctx->priv_data;
+    int ret = 0;
+
+    av_bprint_init(&cat->bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+    cat->start_time = AV_NOPTS_VALUE;
+    cat->duration = 0;
+
+    ret = open_next_file(ctx);
+    if (ret < 0)
+        goto fail;
+
+    return 0;
+
+fail:
+    streamconcat_read_close(ctx);
+    return ret;
+}
+
+
+static int streamconcat_read_packet(AVFormatContext *ctx, AVPacket *pkt)
+{
+    StreamConcatDemuxerContext *cat = ctx->priv_data;
+    int ret;
+    AVStream *source_st;
+    int64_t current_source_start_time;
+    int64_t delta;
+
+    while (1) {
+        ret = av_read_frame(cat->avf, pkt);
+        if (ret == AVERROR_EOF) {
+            if ((ret = open_next_file(ctx)) < 0)
+                return ret;
+            continue;
+        }
+        if (ret < 0)
+            return ret;
+
+        if (pkt->stream_index != cat->source_stream_index) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        break;
+    }
+
+    source_st = cat->avf->streams[pkt->stream_index];
+    av_log(ctx, AV_LOG_DEBUG, "stream:%d pts:%s pts_time:%s dts:%s dts_time:%s",
+           pkt->stream_index,
+           av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, &source_st->time_base),
+           av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &source_st->time_base));
+
+    current_source_start_time = cat->avf->start_time == AV_NOPTS_VALUE ? 0 : cat->avf->start_time;
+    // TODO delta only need to be calculate once per input file
+    delta = av_rescale_q(cat->start_time + cat->duration - current_source_start_time,
+                         AV_TIME_BASE_Q,
+                         source_st->time_base);
+
+    if (pkt->pts != AV_NOPTS_VALUE)
+        pkt->pts += delta;
+    if (pkt->dts != AV_NOPTS_VALUE)
+        pkt->dts += delta;
+
+    av_log(ctx, AV_LOG_DEBUG, " -> pts:%s pts_time:%s dts:%s dts_time:%s\n",
+           av_ts2str(pkt->pts), av_ts2timestr(pkt->pts, &source_st->time_base),
+           av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &source_st->time_base));
+
+    av_log(ctx, AV_LOG_DEBUG, "start_time:%" PRId64 " duration:%" PRId64 " delta:%" PRId64 "\n", cat->start_time, cat->duration, delta);
+
+    pkt->stream_index = 0;
+
+    return ret;
+}
+
+static const AVOption streamconcat_options[] = {
+    { NULL },
+};
+
+static const AVClass streamconcat_demuxer_class = {
+    .class_name = "streamconcat demuxer",
+    .item_name  = av_default_item_name,
+    .option     = streamconcat_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+AVInputFormat ff_streamconcat_demuxer = {
+    .name           = "streamconcat",
+    .long_name      = NULL_IF_CONFIG_SMALL("stream concat"),
+    .priv_data_size = sizeof(StreamConcatDemuxerContext),
+    .read_header    = streamconcat_read_header,
+    .read_packet    = streamconcat_read_packet,
+    .read_close     = streamconcat_read_close,
+    .priv_class     = &streamconcat_demuxer_class,
+};

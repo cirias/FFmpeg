@@ -100,6 +100,7 @@ extern AVInputFormat  ff_codec2_demuxer;
 extern AVOutputFormat ff_codec2_muxer;
 extern AVInputFormat  ff_codec2raw_demuxer;
 extern AVOutputFormat ff_codec2raw_muxer;
+extern AVInputFormat  ff_streamconcat_demuxer;
 extern AVInputFormat  ff_concat_demuxer;
 extern AVOutputFormat ff_crc_muxer;
 extern AVInputFormat  ff_dash_demuxer;
